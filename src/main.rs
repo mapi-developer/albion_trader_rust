@@ -1,54 +1,80 @@
-use pcap::{Device, Capture};
+use pcap::{Capture, Device};
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::Packet;
 
+// Import our new photon module
+mod photon;
+use photon::{parse_photon_header, parse_command_header};
+
 fn main() {
-    // 1. Find the default network device (like eth0 or wlan0)
     let main_device = Device::lookup()
         .expect("Failed to lookup device")
         .expect("No devices found");
-    
+
     println!("Listening on device: {}", main_device.name);
 
-    // 2. Open the capture handle
     let mut cap = Capture::from_device(main_device)
         .unwrap()
-        .promisc(true)     // Listen to all traffic on the interface
-        .snaplen(65535)    // Capture the whole packet
-        .timeout(100)      // 100ms read timeout
+        .promisc(true)
+        .snaplen(65535)
+        .timeout(100)
         .open()
         .unwrap();
 
-    // 3. Apply the BPF filter (same as your Python script)
     cap.filter("udp portrange 5055-5056", true).unwrap();
-
     println!("Sniffer started. Launch Albion Online...");
 
-    // 4. Capture loop
     while let Ok(packet) = cap.next_packet() {
-        // Parse the raw bytes into an Ethernet packet
         if let Some(ethernet) = EthernetPacket::new(packet.data) {
-            
-            // Parse into IPv4
             if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
-                
-                // Parse into UDP
                 if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                    
                     let payload = udp.payload();
-                    
-                    // We only care about packets that actually contain data
-                    if !payload.is_empty() {
-                        println!(
-                            "Captured Photon Packet | Size: {} bytes | {} -> {}", 
-                            payload.len(),
-                            udp.get_source(),
-                            udp.get_destination()
-                        );
-                        
-                        // TODO: Pass `payload` to our Photon decoder
+
+                    // If the payload is too small to be a Photon packet, skip it
+                    if payload.len() < 12 {
+                        continue;
+                    }
+
+                    // 1. Try to parse the Photon Header
+                    match parse_photon_header(payload) {
+                        Ok((mut remaining_bytes, header)) => {
+                            // If it's a valid packet but has 0 commands (like a ping), ignore it
+                            if header.command_count == 0 {
+                                continue;
+                            }
+
+                            // 2. Loop through the number of commands defined in the header
+                            for _ in 0..header.command_count {
+                                // Try to parse the Command Header
+                                match parse_command_header(remaining_bytes) {
+                                    Ok((next_bytes, cmd_header)) => {
+                                        // Command Type 1 is "SendReliable" (Unfragmented data)
+                                        // Command Type 8 is "SendReliableFragment" (Fragmented data)
+                                        if cmd_header.command_type == 1 || cmd_header.command_type == 8 {
+                                            println!(
+                                                "Found Command! Type: {}, Length: {}",
+                                                cmd_header.command_type, cmd_header.length
+                                            );
+                                        }
+
+                                        // Move the pointer forward by the length of this command's data 
+                                        // so we can parse the next command in the loop
+                                        let payload_length = (cmd_header.length - 12) as usize; 
+                                        if next_bytes.len() >= payload_length {
+                                            remaining_bytes = &next_bytes[payload_length..];
+                                        } else {
+                                            break; // Packet was malformed or cut off
+                                        }
+                                    }
+                                    Err(_) => break, // Failed to parse command header
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Not a valid Photon packet
+                        }
                     }
                 }
             }
