@@ -110,12 +110,13 @@ fn handle_payload(payload: &[u8]) {
         Err(_) => payload,
     };
 
-    if let Ok((_, reliable_msg)) = parse_reliable_message(process_data) {
-        // Route the fully decoded message to our handler structure
-        route_reliable_message(
-            reliable_msg.message_type,
-            reliable_msg.code,
-            &reliable_msg.parameters,
-        );
+    // Decode the parameters hashmap using our safe decoder
+    match parse_reliable_message(process_data) {
+        Ok(parameters) => {
+            route_reliable_message(&parameters);
+        },
+        Err(_err) => {
+            // Silent drop of standard structural heartbeat messages
+        }
     }
 }

@@ -5,7 +5,6 @@ use nom::{
     IResult,
 };
 
-// 1. The Rust equivalent of Python's dynamic types
 #[derive(Debug, Clone)]
 pub enum PhotonValue {
     Nil,
@@ -18,20 +17,10 @@ pub enum PhotonValue {
     Boolean(bool),
     ByteSlice(Vec<u8>),
     Slice(Vec<PhotonValue>),
-    Dictionary(Vec<(PhotonValue, PhotonValue)>), // Using Vec of tuples for simple key-value storage
+    Dictionary(Vec<(PhotonValue, PhotonValue)>),
     Hashtable(Vec<(PhotonValue, PhotonValue)>),
 }
 
-// 2. The main payload structure
-#[derive(Debug)]
-pub struct ReliableMessage {
-    pub signature: u8,
-    pub message_type: u8,
-    pub code: u8, // event_code or operation_code
-    pub parameters: HashMap<u8, PhotonValue>,
-}
-
-// 3. Recursive parser for all Photon Data Types
 pub fn parse_value(input: &[u8], param_type: u8) -> IResult<&[u8], PhotonValue> {
     match param_type {
         0 | 42 => Ok((input, PhotonValue::Nil)),
@@ -72,10 +61,14 @@ pub fn parse_value(input: &[u8], param_type: u8) -> IResult<&[u8], PhotonValue> 
         },
         121 => { // 'y' - Array / Slice
             let (input, len) = be_u16(input)?;
+            if len == 0 {
+                return Ok((input, PhotonValue::Slice(Vec::new())));
+            }
             let (input, array_type) = be_u8(input)?;
             let mut current_input = input;
             let mut arr = Vec::new();
             for _ in 0..len {
+                if current_input.is_empty() { break; }
                 let (next_input, val) = parse_value(current_input, array_type)?;
                 arr.push(val);
                 current_input = next_input;
@@ -89,6 +82,7 @@ pub fn parse_value(input: &[u8], param_type: u8) -> IResult<&[u8], PhotonValue> 
             let mut current_input = input;
             let mut dict = Vec::new();
             for _ in 0..len {
+                if current_input.len() < 2 { break; }
                 let (next_input, k) = parse_value(current_input, key_type)?;
                 let (next_input, v) = parse_value(next_input, val_type)?;
                 dict.push((k, v));
@@ -101,6 +95,7 @@ pub fn parse_value(input: &[u8], param_type: u8) -> IResult<&[u8], PhotonValue> 
             let mut current_input = input;
             let mut hash = Vec::new();
             for _ in 0..len {
+                if current_input.len() < 2 { break; }
                 let (next_input, k_type) = be_u8(current_input)?;
                 let (next_input, k) = parse_value(next_input, k_type)?;
                 let (next_input, v_type) = be_u8(next_input)?;
@@ -110,55 +105,55 @@ pub fn parse_value(input: &[u8], param_type: u8) -> IResult<&[u8], PhotonValue> 
             }
             Ok((current_input, PhotonValue::Hashtable(hash)))
         },
-        _ => {
-            // Unrecognized type - return an error so the parser safely bails out
+        unknown_type => {
+            // Instead of crashing, we gracefully fail but print what type code broke us
+            println!("[Decoder] Unknown parameter type code found: {}", unknown_type);
             Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
         }
     }
 }
 
-// 4. Parser for the overall Reliable Message
-pub fn parse_reliable_message(input: &[u8]) -> IResult<&[u8], ReliableMessage> {
-    let (input, signature) = be_u8(input)?;
-    let (input, message_type) = be_u8(input)?;
+pub fn parse_reliable_message(input: &[u8]) -> Result<HashMap<u8, PhotonValue>, String> {
+    if input.len() < 2 { return Err("Payload too small".to_string()); }
+    
+    let (input, _signature) = be_u8::<_, nom::error::Error<&[u8]>>(input).map_err(|e| e.to_string())?;
+    let (input, message_type) = be_u8(input).map_err(|e| e.to_string())?;
 
-    // Mimicking Python's `read_data`: EventData (4) and OperationRequest (2) read 1 byte.
-    // OperationResponse (3 or 7) reads 4 bytes.
-    let (input, code) = match message_type {
-        2 | 4 => be_u8(input)?,
-        3 | 7 => {
-            let (rem, op_code) = be_u8(input)?;
-            let (rem, _) = take(3usize)(rem)?; // Skip response_code + debug type for now
-            (rem, op_code)
+    // Safe parsing bounds checking for type parameters
+    let input = match message_type {
+        2 | 4 => {
+            if input.is_empty() { return Err("Truncated message".to_string()); }
+            &input[1..] // Skip operation_code/event_code byte (we look up parameters directly)
         },
-        _ => (input, 0)
+        3 | 7 => {
+            if input.len() < 4 { return Err("Truncated response".to_string()); }
+            &input[4..] // Skip response headers
+        },
+        _ => input
     };
 
-    let (input, param_count) = be_u16(input)?;
+    if input.len() < 2 { return Err("Missing parameter count".to_string()); }
+    let (mut current_input, param_count) = be_u16::<_, nom::error::Error<&[u8]>>(input).map_err(|e| e.to_string())?;
 
-    let mut current_input = input;
     let mut parameters = HashMap::new();
 
     for _ in 0..param_count {
-        // Stop if we don't have enough bytes to read id + type
         if current_input.len() < 2 { break; }
         
-        let (next_input, param_id) = be_u8(current_input)?;
-        let (next_input, param_type) = be_u8(next_input)?;
+        let (next_input, param_id) = be_u8(current_input).map_err(|e| e.to_string())?;
+        let (next_input, param_type) = be_u8(next_input).map_err(|e| e.to_string())?;
         
         match parse_value(next_input, param_type) {
             Ok((rem, value)) => {
                 parameters.insert(param_id, value);
                 current_input = rem;
             },
-            Err(_) => break, // Safely handle unknown formats
+            Err(_) => {
+                // Stop processing parameters if one field fails, but return what we have!
+                break;
+            }
         }
     }
 
-    Ok((current_input, ReliableMessage {
-        signature,
-        message_type,
-        code,
-        parameters
-    }))
+    Ok(parameters)
 }
