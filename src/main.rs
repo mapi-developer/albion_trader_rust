@@ -3,10 +3,17 @@ use pnet::packet::ethernet::EthernetPacket;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::Packet;
+use std::io::Read;
+use flate2::read::GzDecoder;
 
-// Import our new photon module
+// Tell Rust to use the modules we created
 mod photon;
-use photon::{parse_photon_header, parse_command_header};
+mod fragment_buffer;
+mod photon_decode; // <-- Add this
+
+use photon::{parse_photon_header, parse_command_header, parse_fragment_header};
+use fragment_buffer::FragmentBuffer;
+use photon_decode::parse_reliable_message; // <-- Add this
 
 fn main() {
     let main_device = Device::lookup()
@@ -24,7 +31,10 @@ fn main() {
         .unwrap();
 
     cap.filter("udp portrange 5055-5056", true).unwrap();
-    println!("Sniffer started. Launch Albion Online...");
+    println!("Sniffer started. Launch Albion Online and open the Market...");
+
+    // Initialize our memory-safe Fragment Buffer
+    let mut frag_buffer = FragmentBuffer::new();
 
     while let Ok(packet) = cap.next_packet() {
         if let Some(ethernet) = EthernetPacket::new(packet.data) {
@@ -32,52 +42,88 @@ fn main() {
                 if let Some(udp) = UdpPacket::new(ipv4.payload()) {
                     let payload = udp.payload();
 
-                    // If the payload is too small to be a Photon packet, skip it
-                    if payload.len() < 12 {
-                        continue;
-                    }
+                    if payload.len() < 12 { continue; }
 
-                    // 1. Try to parse the Photon Header
-                    match parse_photon_header(payload) {
-                        Ok((mut remaining_bytes, header)) => {
-                            // If it's a valid packet but has 0 commands (like a ping), ignore it
-                            if header.command_count == 0 {
-                                continue;
-                            }
+                    // 1. Parse the main Photon Header
+                    if let Ok((mut remaining_bytes, header)) = parse_photon_header(payload) {
+                        if header.command_count == 0 { continue; }
 
-                            // 2. Loop through the number of commands defined in the header
-                            for _ in 0..header.command_count {
-                                // Try to parse the Command Header
-                                match parse_command_header(remaining_bytes) {
-                                    Ok((next_bytes, cmd_header)) => {
-                                        // Command Type 1 is "SendReliable" (Unfragmented data)
-                                        // Command Type 8 is "SendReliableFragment" (Fragmented data)
-                                        if cmd_header.command_type == 1 || cmd_header.command_type == 8 {
-                                            println!(
-                                                "Found Command! Type: {}, Length: {}",
-                                                cmd_header.command_type, cmd_header.length
-                                            );
-                                        }
+                        // 2. Loop through all commands in the packet
+                        for _ in 0..header.command_count {
+                            if let Ok((next_bytes, cmd_header)) = parse_command_header(remaining_bytes) {
+                                let payload_length = (cmd_header.length - 12) as usize;
+                                
+                                if next_bytes.len() < payload_length {
+                                    break; 
+                                }
 
-                                        // Move the pointer forward by the length of this command's data 
-                                        // so we can parse the next command in the loop
-                                        let payload_length = (cmd_header.length - 12) as usize; 
-                                        if next_bytes.len() >= payload_length {
-                                            remaining_bytes = &next_bytes[payload_length..];
-                                        } else {
-                                            break; // Packet was malformed or cut off
+                                // This is the actual data for this specific command
+                                let command_data = &next_bytes[..payload_length];
+
+                                // Command Type 1: SendReliable (Unfragmented data, like moving or silver updates)
+                                if cmd_header.command_type == 1 {
+                                    handle_payload(command_data);
+                                } 
+                                // Command Type 8: SendReliableFragment (Big data, like Market Orders)
+                                else if cmd_header.command_type == 8 {
+                                    
+                                    // Parse the extra Fragment Header
+                                    if let Ok((frag_data, frag_header)) = parse_fragment_header(command_data) {
+                                        
+                                        // Feed it to our Buffer. If it returns Some(data), the packet is fully reassembled!
+                                        if let Some(assembled_payload) = frag_buffer.offer(
+                                            frag_header.start_sequence_number,
+                                            frag_header.fragment_count,
+                                            frag_header.total_length,
+                                            frag_header.fragment_offset,
+                                            frag_data
+                                        ) {
+                                            println!("--- Successfully Assembled {} Fragments! ---", frag_header.fragment_count);
+                                            handle_payload(&assembled_payload);
                                         }
                                     }
-                                    Err(_) => break, // Failed to parse command header
                                 }
+
+                                // Move the pointer forward for the next command in the loop
+                                remaining_bytes = &next_bytes[payload_length..];
+                            } else {
+                                break;
                             }
-                        }
-                        Err(_) => {
-                            // Not a valid Photon packet
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+// 3. This function processes fully assembled payloads
+fn handle_payload(payload: &[u8]) {
+    // 1. First, try to decompress it
+    let mut gz = GzDecoder::new(payload);
+    let mut decompressed = Vec::new();
+    
+    let process_data = match gz.read_to_end(&mut decompressed) {
+        Ok(_) => decompressed.as_slice(),
+        Err(_) => payload, // If it's not GZIP compressed, use the raw payload
+    };
+
+    // 2. Decode the Reliable Message dictionary
+    if let Ok((_, reliable_msg)) = parse_reliable_message(process_data) {
+        
+        // Albion usually stores the "Event Code" under dictionary key 252.
+        // E.g., silver updates, market loads, movement.
+        if let Some(event_code_val) = reliable_msg.parameters.get(&252) {
+            println!("🔔 Triggered Event Code: {:?}", event_code_val);
+            
+            // If you want to see all the data for this event (like prices!)
+            println!("Data: {:#?}", reliable_msg.parameters);
+            println!("--------------------------------------------------");
+        }
+        
+        // Dictionary key 253 is usually "Operation Code" (like requests to the market)
+        if let Some(op_code_val) = reliable_msg.parameters.get(&253) {
+            println!("📤 Triggered Operation Code: {:?}", op_code_val);
         }
     }
 }
