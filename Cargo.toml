@@ -1,0 +1,10 @@
+[package]
+name = "albion_trader_rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pcap = "1.2"
+pnet = "0.34"
+flate2 = "1.0"
+nom = "7.1"
