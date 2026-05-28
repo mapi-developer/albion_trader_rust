@@ -67,3 +67,31 @@ pub fn parse_command_header(input: &[u8]) -> IResult<&[u8], CommandHeader> {
         },
     ))
 }
+
+#[derive(Debug)]
+pub struct FragmentHeader {
+    pub start_sequence_number: u32,
+    pub fragment_count: u32,
+    pub fragment_number: u32,
+    pub total_length: u32,
+    pub fragment_offset: u32,
+}
+
+pub fn parse_fragment_header(input: &[u8]) -> IResult<&[u8], FragmentHeader> {
+    let (input, start_sequence_number) = be_u32(input)?;
+    let (input, fragment_count) = be_u32(input)?;
+    let (input, fragment_number) = be_u32(input)?;
+    let (input, total_length) = be_u32(input)?;
+    let (input, fragment_offset) = be_u32(input)?;
+
+    Ok((
+        input,
+        FragmentHeader {
+            start_sequence_number,
+            fragment_count,
+            fragment_number,
+            total_length,
+            fragment_offset,
+        },
+    ))
+}
