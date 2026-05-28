@@ -9,11 +9,14 @@ use flate2::read::GzDecoder;
 // Tell Rust to use the modules we created
 mod photon;
 mod fragment_buffer;
-mod photon_decode; // <-- Add this
+mod photon_decode;
+mod constants;
+mod handlers;
 
 use photon::{parse_photon_header, parse_command_header, parse_fragment_header};
 use fragment_buffer::FragmentBuffer;
-use photon_decode::parse_reliable_message; // <-- Add this
+use photon_decode::parse_reliable_message;
+use handlers::route_reliable_message;
 
 fn main() {
     let main_device = Device::lookup()
@@ -99,31 +102,20 @@ fn main() {
 
 // 3. This function processes fully assembled payloads
 fn handle_payload(payload: &[u8]) {
-    // 1. First, try to decompress it
     let mut gz = GzDecoder::new(payload);
     let mut decompressed = Vec::new();
     
     let process_data = match gz.read_to_end(&mut decompressed) {
         Ok(_) => decompressed.as_slice(),
-        Err(_) => payload, // If it's not GZIP compressed, use the raw payload
+        Err(_) => payload,
     };
 
-    // 2. Decode the Reliable Message dictionary
     if let Ok((_, reliable_msg)) = parse_reliable_message(process_data) {
-        
-        // Albion usually stores the "Event Code" under dictionary key 252.
-        // E.g., silver updates, market loads, movement.
-        if let Some(event_code_val) = reliable_msg.parameters.get(&252) {
-            println!("🔔 Triggered Event Code: {:?}", event_code_val);
-            
-            // If you want to see all the data for this event (like prices!)
-            println!("Data: {:#?}", reliable_msg.parameters);
-            println!("--------------------------------------------------");
-        }
-        
-        // Dictionary key 253 is usually "Operation Code" (like requests to the market)
-        if let Some(op_code_val) = reliable_msg.parameters.get(&253) {
-            println!("📤 Triggered Operation Code: {:?}", op_code_val);
-        }
+        // Route the fully decoded message to our handler structure
+        route_reliable_message(
+            reliable_msg.message_type,
+            reliable_msg.code,
+            &reliable_msg.parameters,
+        );
     }
 }
